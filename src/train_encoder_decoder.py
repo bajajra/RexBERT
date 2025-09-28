@@ -174,7 +174,7 @@ def main():
             print(f"[WARN] torch.compile failed: {e}")
 
     # ---- PACK the pretokenized dataset into fixed-length blocks ----
-    print(f"[INFO] Building packed dataset with block length {args.pack-seq-len} ...")
+    print(f"[INFO] Building packed dataset with block length {args.pack_seq_len} ...")
     packed = make_packed_dataset(
         dataset_path=args.dataset_path,
         tokenizer=tok,
