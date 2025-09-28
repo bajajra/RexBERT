@@ -70,23 +70,53 @@ def pack_stream_to_blocks(ds, block_len: int, eos_id: int, drop_last: bool = Tru
             "attention_mask": [1]*len(buf) + [0]*pad_len,
         }
 
-def make_packed_dataset(dataset_path: str, tokenizer, pack_len: int, out_cap: int | None = None) -> Dataset:
+def make_packed_dataset(dataset_path: str, tokenizer, pack_len: int, out_cap: int | None = None, num_proc: int = 16) -> Dataset:
     """
-    Build a packed Dataset from an on-disk pretokenized dataset without loading everything in RAM.
-    Uses Dataset.from_generator to stay memory-friendly.
+    Build a packed Dataset from an on-disk pretokenized dataset.
+    Uses `ds.map` for parallel processing.
     """
     base = load_from_disk(dataset_path)
+    eos_id = tokenizer.eos_token_id or tokenizer.sep_token_id
 
-    def gen():
-        n = 0
-        for item in pack_stream_to_blocks(base, block_len=pack_len, eos_id=tokenizer.eos_token_id or tokenizer.sep_token_id, drop_last=True):
-            yield item
-            n += 1
-            if out_cap and n >= out_cap:
-                break
+    def pack_batch(batch: Dict[str, List]) -> Dict[str, List]:
+        """Concatenate and chunk a batch of examples."""
+        # 1. Concatenate all tokens in the batch, separated by EOS
+        all_tokens = []
+        for ids, mask in zip(batch["input_ids"], batch["attention_mask"]):
+            L = int(np.sum(mask))
+            if L > 0:
+                all_tokens.extend(ids[:L])
+                if eos_id is not None:
+                    all_tokens.append(eos_id)
 
-    # infer features from a few samples
-    return Dataset.from_generator(gen)
+        # 2. Chunk the concatenated tokens into fixed-length blocks
+        packed_ids = []
+        for i in range(0, len(all_tokens), pack_len):
+            chunk = all_tokens[i : i + pack_len]
+            if len(chunk) == pack_len:
+                packed_ids.append(chunk)
+        
+        # 3. Create attention masks for the packed blocks
+        return {
+            "input_ids": packed_ids,
+            "attention_mask": [[1] * pack_len for _ in packed_ids],
+        }
+
+    # Use map to parallelize the packing process.
+    # batched=True sends chunks of the dataset to pack_batch.
+    # remove_columns is important to drop the original, variable-length columns.
+    packed = base.map(
+        pack_batch,
+        batched=True,
+        batch_size=1000, # Adjust batch_size based on RAM
+        num_proc=num_proc,
+        remove_columns=base.column_names,
+    )
+
+    if out_cap and out_cap > 0:
+        packed = packed.select(range(min(out_cap, len(packed))))
+
+    return packed
 
 
 # ------------------------- Training script -------------------------
