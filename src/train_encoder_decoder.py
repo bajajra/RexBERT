@@ -1,326 +1,161 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 """
-Train an encoder–decoder model initialised from Gemma3 on an e‑commerce
-dataset using a masked language modelling objective.
+MLM training for the converted Gemma3 encoder (bidirectional) using pre-tokenized Ecom-niverse.
 
-This script implements the first stages of the EmbeddingGemma recipe:
+- Expects a directory produced by prepare_ecom_data.py with columns:
+  input_ids (List[int]), attention_mask (List[int]) — already padded/truncated.
 
-* We initialise an `EncoderDecoderModel` from the pretrained
-  `google/gemma-3-270m` weights.  This step follows the adaptation
-  procedure described in the EmbeddingGemma paper: we take a decoder‑only
-  model and convert it into an encoder–decoder architecture by reusing
-  the same weights for both the encoder and decoder.  The resulting
-  model is capable of ingesting a fully observed input (via the encoder)
-  and generating a target sequence (via the decoder).
+- Uses Hugging Face Trainer + DataCollatorForLanguageModeling (BERT-style MLM).
+- Ensures a mask token exists; if not, adds "<mask>" and resizes embeddings.
 
-* We then further adapt this model via a masked language modelling (MLM)
-  objective reminiscent of BERT, but implemented within a seq2seq
-  framework.  For each example we produce a masked version of the
-  original input (some tokens are replaced with a `[MASK]` token) and
-  compute a reconstruction loss only for those masked positions.  The
-  decoder learns to predict the original tokens, and the encoder
-  consequently learns bidirectional contextual representations.  This
-  objective aligns with the goal of producing a strong encoder as
-  described in the EmbeddingGemma paper【622905097956174†L110-L117】.
-
-After training completes the script saves both the full
-encoder–decoder model and the standalone encoder for downstream use.
-
-Example usage:
-
-```bash
-python train_gemma_encoder.py \
-    --dataset-path data/ecom_prepared \
-    --output-dir models/gemma3-ecom-encoder \
-    --per-device-batch-size 4 \
-    --num-epochs 1
-```
-
-This script requires the `transformers`, `datasets` and `torch`
-packages.  Install them via:
-
-```bash
-pip install --upgrade transformers datasets torch
-```
+Usage example:
+    python train_mlm_gemma3_encoder.py \
+      --model-dir ./gemma3-270m-encoder-bidir \
+      --dataset-path ./data/ecom_prepared \
+      --output-dir ./models/gemma3-270m-ecom-mlm \
+      --batch-size 8 \
+      --epochs 3 \
+      --lr 1e-4 \
+      --mlm-prob 0.20
 """
 
-import argparse
-import logging
-import os
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from __future__ import annotations
+import argparse, os, math, random
+from typing import Optional
 
 import numpy as np
-import torch  # type: ignore
-from datasets import Dataset, load_from_disk  # type: ignore
+import torch
+from datasets import load_from_disk
 from transformers import (
     AutoTokenizer,
-    EncoderDecoderModel,
-    DataCollatorForSeq2Seq,
+    DataCollatorForLanguageModeling,
     Trainer,
     TrainingArguments,
+    set_seed,
 )
 
-
-logger = logging.getLogger(__name__)
-
-
-def mask_tokens(
-    input_ids: List[int],
-    mask_token_id: int,
-    special_token_ids: List[int],
-    vocab_size: int,
-    mlm_probability: float = 0.15,
-) -> Tuple[List[int], List[int]]:
-    """Perform BERT‑style random masking on a single sequence.
-
-    Returns a pair of lists `(masked_input_ids, labels)` where
-    `labels` contains the original token ids for masked positions and
-    `-100` elsewhere (to ignore those positions in the loss).
-
-    The masking procedure follows the common heuristic used in BERT and
-    other MLM setups: for each token (excluding special tokens) a
-    masking decision is sampled with probability `mlm_probability`.
-    * 80% of masked tokens are replaced by `[MASK]`.
-    * 10% are replaced by a random token.
-    * 10% are left unchanged.
-
-    Args:
-        input_ids: A list of token ids representing the input sequence.
-        mask_token_id: The token id used for masking.
-        special_token_ids: A list of special token ids that should never
-            be masked (e.g. `pad_token_id`, `eos_token_id`, etc.).
-        mlm_probability: Probability of masking each token.
-
-    Returns:
-        Tuple of (masked_input_ids, labels).
-    """
-    labels = input_ids.copy()
-    masked_input = input_ids.copy()
-
-    for i, token_id in enumerate(input_ids):
-        if token_id in special_token_ids:
-            labels[i] = -100
-            continue
-        if np.random.rand() < mlm_probability:
-            # This token will be masked
-            # 80% replace with mask token
-            if np.random.rand() < 0.8:
-                masked_input[i] = mask_token_id
-            # 10% replace with random token
-            elif np.random.rand() < 0.5:
-                masked_input[i] = int(np.random.randint(0, vocab_size))
-            # 10% leave unchanged
-            # labels[i] remains original token id
-        else:
-            # Not masked; label should be ignored
-            labels[i] = -100
-    return masked_input, labels
+# Import your custom encoder class used during conversion
+from gemma3_biencoder import Gemma3EncoderForMaskedLM
 
 
-def preprocess_dataset(
-    dataset: Dataset,
-    tokenizer: AutoTokenizer,
-    mlm_probability: float = 0.15,
-) -> Dataset:
-    """Apply masking to the entire dataset.
-
-    The input dataset must contain `input_ids` and `attention_mask` columns.
-    The returned dataset will contain `input_ids` (masked), `attention_mask`
-    and `labels` with `-100` in positions that are not masked.
-
-    Args:
-        dataset: A `datasets.Dataset` with tokenised examples.
-        tokenizer: The tokenizer used for encoding the data.  The mask
-            token must already exist in the tokenizer's vocabulary.
-        mlm_probability: Masking probability for each token.
-
-    Returns:
-        A new `datasets.Dataset` with masked inputs and labels.
-    """
-    mask_token_id = tokenizer.mask_token_id
-    special_ids = set(tokenizer.all_special_ids)
-    vocab_size = len(tokenizer)
-
-    def transform(batch: Dict[str, List[List[int]]]) -> Dict[str, List[List[int]]]:
-        masked_inputs = []
-        labels_list = []
-        for input_ids in batch["input_ids"]:
-            masked, labels = mask_tokens(
-                input_ids,
-                mask_token_id=mask_token_id,
-                special_token_ids=special_ids,
-                vocab_size=vocab_size,
-                mlm_probability=mlm_probability,
-            )
-            masked_inputs.append(masked)
-            labels_list.append(labels)
-        return {"input_ids": masked_inputs, "labels": labels_list}
-
-    # Use batched mapping for efficiency; remove original attention_mask
-    processed = dataset.map(
-        transform,
-        batched=True,
-        remove_columns=[col for col in dataset.column_names if col not in {"input_ids", "attention_mask"}],
-    )
-    return processed
+def parse_args():
+    ap = argparse.ArgumentParser(description="MLM train Gemma3 encoder on Ecom-niverse (pre-tokenized).")
+    ap.add_argument("--model-dir", required=True, help="Path to converted encoder (e.g., ./gemma3-270m-encoder-bidir)")
+    ap.add_argument("--dataset-path", required=True, help="Path to pre-tokenized dataset (save_to_disk dir)")
+    ap.add_argument("--output-dir", required=True, help="Where to save checkpoints")
+    ap.add_argument("--mlm-prob", type=float, default=0.15, help="Masking probability (default 0.15)")
+    ap.add_argument("--batch-size", type=int, default=4, help="Per-device batch size")
+    ap.add_argument("--epochs", type=int, default=2, help="Num epochs")
+    ap.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    ap.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
+    ap.add_argument("--warmup-ratio", type=float, default=0.03, help="Warmup ratio")
+    ap.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Grad accumulation")
+    ap.add_argument("--save-steps", type=int, default=2000, help="Checkpoint save frequency (steps)")
+    ap.add_argument("--logging-steps", type=int, default=100, help="Logging frequency (steps)")
+    ap.add_argument("--seed", type=int, default=42, help="Random seed")
+    ap.add_argument("--shuffle-buffer", type=int, default=0, help="Optional in-epoch shuffling buffer (0=off)")
+    ap.add_argument("--bf16", action="store_true", help="Force bf16 if available")
+    ap.add_argument("--fp16", action="store_true", help="Force fp16 if available")
+    ap.add_argument("--pad-to-multiple-of", type=int, default=8, help="Pad to multiple of N (for tensor cores)")
+    ap.add_argument("--max-train-samples", type=int, default=0, help="Optional cap for quick runs")
+    return ap.parse_args()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train Gemma3 encoder via MLM on e‑commerce data")
-    parser.add_argument(
-        "--dataset-path",
-        type=str,
-        required=True,
-        help="Path to the tokenised Ecom‑niverse dataset (created by prepare_ecom_data.py)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        required=True,
-        help="Directory to save the trained model and tokenizer",
-    )
-    parser.add_argument(
-        "--pretrained-model",
-        type=str,
-        default="google/gemma-3-270m",
-        help="Name or path of the pretrained Gemma model to adapt",
-    )
-    parser.add_argument(
-        "--per-device-batch-size",
-        type=int,
-        default=4,
-        help="Batch size per device during training",
-    )
-    parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=1e-4,
-        help="Initial learning rate for the AdamW optimiser",
-    )
-    parser.add_argument(
-        "--num-epochs",
-        type=int,
-        default=3,
-        help="Number of training epochs",
-    )
-    parser.add_argument(
-        "--mlm-probability",
-        type=float,
-        default=0.15,
-        help="Probability of masking each token (BERT style)",
-    )
-    parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=0.01,
-        help="Weight decay coefficient",
-    )
-    parser.add_argument(
-        "--warmup-steps",
-        type=int,
-        default=500,
-        help="Number of warmup steps for the learning rate scheduler",
-    )
-    parser.add_argument(
-        "--save-steps",
-        type=int,
-        default=10_000,
-        help="Interval (in training steps) at which to save checkpoints",
-    )
-    parser.add_argument(
-        "--logging-steps",
-        type=int,
-        default=100,
-        help="Interval of logging",
-    )
-    parser.add_argument(
-        "--max-train-samples",
-        type=int,
-        default=0,
-        help="Optional maximum number of training examples to use.  Useful for quick experiments",
-    )
-    args = parser.parse_args()
-
+def main():
+    args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    # Load the preprocessed dataset
-    logger.info("Loading dataset from %s", args.dataset_path)
-    dataset = load_from_disk(args.dataset_path)
-    # Optionally subsample for debugging
-    if args.max_train_samples:
-        dataset = dataset.select(range(args.max_train_samples))
+    set_seed(args.seed)
 
-    # Load tokenizer and ensure mask token exists
-    tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
+    # 1) Load tokenizer and ensure there is a mask token for MLM
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, use_fast=True)
     if tokenizer.mask_token is None:
-        logger.info("Tokenizer has no mask token; adding <mask> as the mask token")
+        print("[INFO] Adding <mask> token to tokenizer and resizing embeddings.")
         tokenizer.add_special_tokens({"mask_token": "<mask>"})
-    # Preprocess dataset to create masked inputs and labels
-    logger.info("Applying masking to dataset (mlm_probability=%.2f)", args.mlm_probability)
-    with torch.no_grad():
-        processed_dataset = preprocess_dataset(dataset, tokenizer, mlm_probability=args.mlm_probability)
 
-    # Initialise encoder–decoder model from a pretrained decoder
-    logger.info("Initialising EncoderDecoderModel from %s", args.pretrained_model)
-    model = EncoderDecoderModel.from_encoder_decoder_pretrained(
-        args.pretrained_model,
-        args.pretrained_model,
+    # 2) Load model (your converted encoder) and resize if tokenizer changed
+    dtype = torch.bfloat16 if (args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else (
+        torch.float16 if (args.fp16 and torch.cuda.is_available()) else torch.float32
     )
-    # Resize token embeddings if special tokens were added
-    model.resize_token_embeddings(len(tokenizer))
-    # Set special token ids required by seq2seq models
-    model.config.decoder_start_token_id = tokenizer.bos_token_id or tokenizer.cls_token_id
-    model.config.pad_token_id = tokenizer.pad_token_id
-    model.config.eos_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.sep_token_id
-    # Reduce sequence lengths if needed (Gemma 270M can handle long contexts)
+    model = Gemma3EncoderForMaskedLM.from_pretrained(args.model_dir, torch_dtype=dtype)
+    if len(tokenizer) != model.get_input_embeddings().num_embeddings:
+        model.resize_token_embeddings(len(tokenizer))
 
-    # Data collator pads inputs and creates decoder_input_ids from labels
-    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding="longest")
+    # 3) Load pre-tokenized dataset (arrow on disk)
+    ds = load_from_disk(args.dataset_path)
+    # Optional small run
+    if args.max_train_samples and args.max_train_samples < len(ds):
+        ds = ds.select(range(args.max_train_samples))
 
-    # Prepare training arguments
-    total_steps = None
-    training_args = TrainingArguments(
+    # Optional lightweight shuffle for better mixing across shards
+    if args.shuffle_buffer and args.shuffle_buffer > 0:
+        # Use Dataset.shuffle for on-disk datasets (seeded)
+        ds = ds.shuffle(seed=args.seed)
+
+    # Set format for faster collation
+    ds = ds.with_format(type="torch", columns=["input_ids", "attention_mask"])
+
+    # 4) MLM data collator (BERT-style) acting on already-tokenized inputs
+    collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=True,
+        mlm_probability=args.mlm_prob,
+        pad_to_multiple_of=args.pad_to_multiple_of if args.pad_to_multiple_of > 0 else None,
+    )
+
+    # 5) TrainingArguments
+    # mixed precision flags: prefer bf16 on Ampere+ if not manually overridden
+    use_bf16 = False
+    use_fp16 = False
+    if torch.cuda.is_available():
+        if args.bf16 and torch.cuda.is_bf16_supported():
+            use_bf16 = True
+        elif args.fp16:
+            use_fp16 = True
+
+    targs = TrainingArguments(
         output_dir=args.output_dir,
-        per_device_train_batch_size=args.per_device_batch_size,
-        num_train_epochs=args.num_epochs,
-        learning_rate=args.learning_rate,
+        per_device_train_batch_size=args.batch_size,
+        num_train_epochs=args.epochs,
+        learning_rate=args.lr,
         weight_decay=args.weight_decay,
-        warmup_steps=args.warmup_steps,
-        save_steps=args.save_steps,
+        warmup_ratio=args.warmup_ratio,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         logging_steps=args.logging_steps,
-        eval_strategy="steps",
-        gradient_accumulation_steps=1,
-        bf16=True,
-        report_to=[],
+        save_steps=args.save_steps,
+        save_total_limit=3,
+        dataloader_pin_memory=True,
+        dataloader_num_workers=4,
+        fp16=use_fp16,
+        bf16=use_bf16,
+        report_to=[],                     # no wandb by default
+        remove_unused_columns=False,      # keep input_ids/attention_mask for our custom model
     )
 
-    # Define Trainer
     trainer = Trainer(
         model=model,
-        args=training_args,
-        train_dataset=processed_dataset,
-        data_collator=data_collator,
+        args=targs,
+        train_dataset=ds,
+        data_collator=collator,
+        tokenizer=tokenizer,
     )
-    # Train
-    logger.info("Starting training")
-    trainer.train()
-    logger.info("Training complete")
 
-    # Save the full model and tokenizer
-    logger.info("Saving full encoder–decoder model to %s", args.output_dir)
+    print("[INFO] Starting training…")
+    trainer.train()
+    print("[INFO] Training complete.")
+
+    # Save full model + tokenizer
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 
-    # Extract and save just the encoder for downstream use
-    encoder_output_dir = os.path.join(args.output_dir, "encoder")
-    logger.info("Saving encoder to %s", encoder_output_dir)
-    os.makedirs(encoder_output_dir, exist_ok=True)
-    model.get_encoder().save_pretrained(encoder_output_dir)
-    # Also save tokenizer here for convenience
-    tokenizer.save_pretrained(encoder_output_dir)
-    logger.info("All done.  The encoder can now be loaded with `AutoModel.from_pretrained('%s')`.", encoder_output_dir)
+    # Also save just the encoder again (same format, convenient path)
+    encoder_dir = os.path.join(args.output_dir, "encoder")
+    os.makedirs(encoder_dir, exist_ok=True)
+    model.save_pretrained(encoder_dir)
+    tokenizer.save_pretrained(encoder_dir)
+    print(f"[INFO] Saved encoder to: {encoder_dir}")
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     main()
