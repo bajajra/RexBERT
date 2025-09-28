@@ -1,32 +1,25 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
 """
-MLM training for the converted Gemma3 encoder (bidirectional) on pre-tokenized Ecom-niverse,
-with optional FlashAttention (FA2 or SDPA flash) and gradient checkpointing.
+MLM training for your Gemma3 bidirectional encoder with:
+  - Sequence packing (concatenate trimmed examples into fixed-length blocks)
+  - FlashAttention-2 (if available) / bf16 / tf32
+  - Gradient checkpointing + length grouping
+  - Adjustable sliding-window for local attention (ModernBERT-like efficiency)
 
-Usage:
-  pip install -U "transformers>=4.46" datasets torch
-  # Optional for FA2 (Ampere+ GPUs):
-  pip install "flash-attn>=2.5.7" --no-build-isolation
-
-  python train_mlm_gemma3_encoder.py \
-    --model-dir ./gemma3-270m-encoder-bidir \
-    --dataset-path ./data/ecom_prepared \
-    --output-dir ./models/gemma3-270m-ecom-mlm-fa2-gc \
-    --batch-size 8 --epochs 3 --lr 1e-4 --mlm-prob 0.20 \
-    --attn-impl flash_attention_2 \
-    --grad-checkpointing \
-    --bf16
+Assumes:
+  * You already converted -> ./gemma3-270m-encoder-bidir (or similar)
+  * You prepared pretokenized data -> ./data/ecom_prepared with columns:
+      input_ids (List[int]) and attention_mask (List[int])
 """
 
 from __future__ import annotations
-import argparse, os
-from typing import Optional
-import importlib
+import argparse, os, math, random
+from typing import Dict, Iterator, List, Tuple
 
+import numpy as np
 import torch
-from datasets import load_from_disk
+from datasets import load_from_disk, Dataset, DatasetDict
 from transformers import (
     AutoTokenizer,
     DataCollatorForLanguageModeling,
@@ -35,70 +28,98 @@ from transformers import (
     set_seed,
 )
 
-# Your custom encoder wrapper (patched version that supports padding-only 4D masks)
+# Your custom encoder (bidirectional, MLM head)
 from gemma3_biencoder import Gemma3EncoderForMaskedLM
 
 
+# ------------------------- Packing utilities -------------------------
+
+def iter_trimmed_tokens(ds, eos_id: int) -> Iterator[int]:
+    """
+    Stream all NON-PAD tokens from the dataset, inserting EOS between examples
+    (so masking/reconstruction doesn't bleed sentences together too much).
+    """
+    for rec in ds:
+        ids = rec["input_ids"]
+        mask = rec["attention_mask"]
+        # trim pads
+        L = int(np.sum(mask))
+        if L <= 0:
+            continue
+        yield from ids[:L]
+        if eos_id is not None:
+            yield eos_id
+
+def pack_stream_to_blocks(ds, block_len: int, eos_id: int, drop_last: bool = True) -> Iterator[Dict[str, List[int]]]:
+    """
+    Concatenate trimmed token streams into fixed-length blocks of size block_len.
+    Builds attention_mask=1 for all tokens in each block.
+    """
+    buf: List[int] = []
+    for tok in iter_trimmed_tokens(ds, eos_id):
+        buf.append(int(tok))
+        while len(buf) >= block_len:
+            chunk = buf[:block_len]
+            buf = buf[block_len:]
+            yield {"input_ids": chunk, "attention_mask": [1]*block_len}
+    if not drop_last and len(buf) > 0:
+        # pad the tail to block_len (rarely used; packed training prefers drop_last)
+        pad_len = block_len - len(buf)
+        yield {
+            "input_ids": buf + [0]*pad_len,
+            "attention_mask": [1]*len(buf) + [0]*pad_len,
+        }
+
+def make_packed_dataset(dataset_path: str, tokenizer, pack_len: int, out_cap: int | None = None) -> Dataset:
+    """
+    Build a packed Dataset from an on-disk pretokenized dataset without loading everything in RAM.
+    Uses Dataset.from_generator to stay memory-friendly.
+    """
+    base = load_from_disk(dataset_path)
+
+    def gen():
+        n = 0
+        for item in pack_stream_to_blocks(base, block_len=pack_len, eos_id=tokenizer.eos_token_id or tokenizer.sep_token_id, drop_last=True):
+            yield item
+            n += 1
+            if out_cap and n >= out_cap:
+                break
+
+    # infer features from a few samples
+    return Dataset.from_generator(gen)
+
+
+# ------------------------- Training script -------------------------
+
 def parse_args():
-    ap = argparse.ArgumentParser(description="MLM train Gemma3 encoder on Ecom-niverse (pre-tokenized).")
+    ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True, help="Path to converted encoder (e.g., ./gemma3-270m-encoder-bidir)")
-    ap.add_argument("--dataset-path", required=True, help="Path to pre-tokenized dataset (save_to_disk dir)")
+    ap.add_argument("--dataset-path", required=True, help="Path to pretokenized dataset (save_to_disk dir)")
     ap.add_argument("--output-dir", required=True, help="Where to save checkpoints")
-
-    ap.add_argument("--mlm-prob", type=float, default=0.15, help="Masking probability")
-    ap.add_argument("--batch-size", type=int, default=4, help="Per-device batch size")
-    ap.add_argument("--epochs", type=int, default=2, help="Num epochs")
-    ap.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    ap.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
-    ap.add_argument("--warmup-ratio", type=float, default=0.03, help="Warmup ratio")
-    ap.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Grad accumulation")
-    ap.add_argument("--save-steps", type=int, default=2000, help="Checkpoint save frequency (steps)")
-    ap.add_argument("--logging-steps", type=int, default=100, help="Logging frequency (steps)")
-    ap.add_argument("--seed", type=int, default=42, help="Random seed")
-    ap.add_argument("--shuffle-buffer", type=int, default=0, help="Optional in-epoch shuffle (0=off)")
-    ap.add_argument("--pad-to-multiple-of", type=int, default=8, help="Pad to multiple of N (tensor cores)")
-
-    # Precision
-    ap.add_argument("--bf16", action="store_true", help="Use bf16 (Ampere+)")
-    ap.add_argument("--fp16", action="store_true", help="Use fp16")
-
-    # NEW: attention implementation + grad checkpointing
-    ap.add_argument("--attn-impl", type=str, default="auto",
-                    choices=["auto", "flash_attention_2", "sdpa", "eager"],
-                    help="Attention backend: try FA2, SDPA, or eager.")
-    ap.add_argument("--grad-checkpointing", action="store_true",
-                    help="Enable gradient checkpointing (use_cache will be disabled).")
+    # Efficiency / ModernBERT-like toggles
+    ap.add_argument("--pack-seq-len", type=int, default=2048, help="Packed block length (tokens)")
+    ap.add_argument("--pack-cap", type=int, default=0, help="Optional cap (#packed blocks) for quick runs")
+    ap.add_argument("--group-by-length", action="store_true", help="Enable Trainer length-based packing (minor win if not pre-packed)")
+    ap.add_argument("--sliding-window", type=int, default=128, help="Local attention window for Gemma3 (smaller => less memory)")
+    ap.add_argument("--flash-attn2", action="store_true", help="Try to force FlashAttention-2 attention implementation")
+    ap.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing")
+    ap.add_argument("--compile", action="store_true", help="torch.compile for a bit more speed (PyTorch 2.3+)")
+    # Standard training knobs
+    ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--epochs", type=int, default=2)
+    ap.add_argument("--lr", type=float, default=2e-5)
+    ap.add_argument("--weight-decay", type=float, default=0.01)
+    ap.add_argument("--warmup-ratio", type=float, default=0.03)
+    ap.add_argument("--mlm-prob", type=float, default=0.15)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--bf16", action="store_true")
+    ap.add_argument("--fp16", action="store_true")
+    ap.add_argument("--grad-accum", type=int, default=4)
+    ap.add_argument("--save-steps", type=int, default=2000)
+    ap.add_argument("--logging-steps", type=int, default=100)
+    ap.add_argument("--pad-to-multiple-of", type=int, default=8)
+    ap.add_argument("--max-train-pct", type=float, default=1.0, help="Use first pct of packed dataset (0<..<=1.0)")
     return ap.parse_args()
-
-
-def _fa2_available() -> bool:
-    try:
-        return importlib.util.find_spec("flash_attn") is not None
-    except Exception:
-        return False
-
-
-def _set_attn_impl(model: Gemma3EncoderForMaskedLM, impl: str):
-    """
-    Try to set attention implementation on the encoder/model/config, depending on what
-    this Transformers version exposes.
-    """
-    # Preferred path: encoder.set_attn_implementation if present
-    if hasattr(model, "encoder") and hasattr(model.encoder, "set_attn_implementation"):
-        model.encoder.set_attn_implementation(impl)
-        print(f"[INFO] Set encoder attention implementation -> {impl}")
-        return
-    # Sometimes exists on the top-level module
-    if hasattr(model, "set_attn_implementation"):
-        model.set_attn_implementation(impl)
-        print(f"[INFO] Set model attention implementation -> {impl}")
-        return
-    # Fallback: stash on config (many models read this)
-    try:
-        model.config.attn_implementation = impl
-    except Exception:
-        setattr(model.config, "_attn_implementation", impl)
-    print(f"[INFO] Recorded attention implementation on config -> {impl} (model may read at layer build time)")
 
 
 def main():
@@ -106,120 +127,122 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     set_seed(args.seed)
 
-    # Slight perf win on Ampere+ even with SDPA/eager
-    torch.set_float32_matmul_precision("high")
+    # ---- Load tokenizer & model ----
+    tok = AutoTokenizer.from_pretrained(args.model_dir, use_fast=True)
+    if tok.mask_token is None:
+        tok.add_special_tokens({"mask_token": "<mask>"})
 
-    # 1) Tokenizer (+ ensure MLM mask token)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, use_fast=True)
-    if tokenizer.mask_token is None:
-        print("[INFO] Adding <mask> token to tokenizer and resizing embeddings.")
-        tokenizer.add_special_tokens({"mask_token": "<mask>"})
-
-    # 2) Model load with desired dtype
-    dtype = torch.bfloat16 if (args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else (
-        torch.float16 if (args.fp16 and torch.cuda.is_available()) else torch.float32
-    )
-    model = Gemma3EncoderForMaskedLM.from_pretrained(args.model_dir, torch_dtype=dtype)
-
-    # Resize if tokenizer changed
-    if len(tokenizer) != model.get_input_embeddings().num_embeddings:
-        model.resize_token_embeddings(len(tokenizer))
-
-    # 3) Attention implementation selection
-    chosen_impl = args.attn_impl
-    if args.attn_impl == "auto":
-        if _fa2_available() and torch.cuda.is_available():
-            chosen_impl = "flash_attention_2"
-        else:
-            # SDPA uses PyTorch's scaled_dot_product_attention; will select flash kernel when available
-            chosen_impl = "sdpa"
-
-    # Apply the selection
-    _set_attn_impl(model, chosen_impl)
-
-    # If using SDPA, you can force flash kernel where supported:
-    # (optional; PyTorch will usually pick it automatically)
-    if chosen_impl == "sdpa" and torch.cuda.is_available():
+    # dtype selection
+    dtype = torch.float32
+    if torch.cuda.is_available():
+        if args.bf16 and torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+        elif args.fp16:
+            dtype = torch.float16
+        # allow tf32 for matmul on Ampere+
         try:
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-            torch.backends.cuda.enable_math_sdp(True)
-            print("[INFO] Enabled SDPA backends (flash/mem_efficient/math).")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         except Exception:
             pass
 
-    # 4) Gradient checkpointing
-    if args.grad_checkpointing:
-        # Encoder-only model: make sure we don't use KV cache anywhere
-        if hasattr(model.config, "use_cache"):
-            model.config.use_cache = False
-        # Recommended on PT2.1+ with HF: use_reentrant=False
+    model = Gemma3EncoderForMaskedLM.from_pretrained(args.model_dir, torch_dtype=dtype)
+    if len(tok) != model.get_input_embeddings().num_embeddings:
+        model.resize_token_embeddings(len(tok))
+
+    # ModernBERT-like: shrink local window; Gemma3 already alternates local/global.
+    # This reduces memory while keeping periodic global attention.
+    if hasattr(model.config, "sliding_window"):
+        model.config.sliding_window = int(args.sliding_window)
+
+    # Try to engage FlashAttention-2
+    # Different HF versions gate this under _attn_implementation or attn_implementation
+    if args.flash_attn2:
+        for key in ["_attn_implementation", "attn_implementation"]:
+            if hasattr(model.config, key):
+                setattr(model.config, key, "flash_attention_2")
+
+    # Gradient checkpointing (big memory saver)
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+
+    # torch.compile (optional)
+    if args.compile:
         try:
-            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        except TypeError:
-            # Older HF fallback
-            model.gradient_checkpointing_enable()
-        print("[INFO] Gradient checkpointing enabled.")
+            model = torch.compile(model)
+        except Exception as e:
+            print(f"[WARN] torch.compile failed: {e}")
 
-    # 5) Load pre-tokenized dataset
-    ds = load_from_disk(args.dataset_path)
-    if args.shuffle_buffer and args.shuffle_buffer > 0:
-        ds = ds.shuffle(seed=args.seed)
-    ds = ds.with_format(type="torch", columns=["input_ids", "attention_mask"])
+    # ---- PACK the pretokenized dataset into fixed-length blocks ----
+    print(f"[INFO] Building packed dataset with block length {args.pack-seq-len} ...")
+    packed = make_packed_dataset(
+        dataset_path=args.dataset_path,
+        tokenizer=tok,
+        pack_len=args.pack_seq_len,
+        out_cap=(args.pack_cap if args.pack_cap > 0 else None),
+    )
+    # (Optional) subselect a percentage for quick runs
+    if args.max_train_pct < 1.0:
+        n = len(packed)
+        m = max(1, int(n * args.max_train_pct))
+        packed = packed.select(range(m))
 
-    # 6) MLM collator
+    # Add a length column for grouped sampling (doesn't matter much when everything is equal length)
+    packed = packed.map(lambda ex: {"length": int(sum(ex["attention_mask"]))})
+    packed = packed.with_format(type="torch", columns=["input_ids", "attention_mask"])
+
+    # ---- Collator: dynamic BERT-style masking on packed blocks ----
     collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
+        tokenizer=tok,
         mlm=True,
         mlm_probability=args.mlm_prob,
-        pad_to_multiple_of=args.pad_to_multiple_of if args.pad_to_multiple_of > 0 else None,
+        pad_to_multiple_of=(args.pad_to_multiple_of if args.pad_to_multiple_of > 0 else None),
     )
 
-    # 7) TrainingArguments
-    use_bf16 = bool(dtype == torch.bfloat16)
-    use_fp16 = bool(dtype == torch.float16)
-
+    # ---- Training args ----
+    use_bf16 = (dtype == torch.bfloat16)
+    use_fp16 = (dtype == torch.float16)
     targs = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
         num_train_epochs=args.epochs,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=3,
         dataloader_pin_memory=True,
         dataloader_num_workers=4,
-        fp16=use_fp16,
-        bf16=use_bf16,
         report_to=[],
         remove_unused_columns=False,
+        fp16=use_fp16,
+        bf16=use_bf16,
+        optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
+        group_by_length=args.group_by_length,
+        length_column_name="length",
     )
 
     trainer = Trainer(
         model=model,
         args=targs,
-        train_dataset=ds,
+        train_dataset=packed,
         data_collator=collator,
-        tokenizer=tokenizer,
+        tokenizer=tok,
     )
 
-    print(f"[INFO] Starting training with attn_impl='{chosen_impl}', "
-          f"grad_checkpointing={'on' if args.grad_checkpointing else 'off'}, "
-          f"dtype={dtype}")
+    print("[INFO] Starting training...")
     trainer.train()
     print("[INFO] Training complete.")
 
-    # Save model + tokenizer; also save encoder path
+    # Save
     trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-
+    tok.save_pretrained(args.output_dir)
     enc_dir = os.path.join(args.output_dir, "encoder")
     os.makedirs(enc_dir, exist_ok=True)
     model.save_pretrained(enc_dir)
-    tokenizer.save_pretrained(enc_dir)
+    tok.save_pretrained(enc_dir)
     print(f"[INFO] Saved encoder to: {enc_dir}")
 
 
