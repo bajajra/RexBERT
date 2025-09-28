@@ -1,4 +1,4 @@
-# --- begin patched Gemma3EncoderForMaskedLM ---
+# gemma3_biencoder.py  (patched forward)
 from __future__ import annotations
 import inspect
 import torch
@@ -17,20 +17,15 @@ def _padding_only_4d_mask(attention_mask: Optional[Tensor],
                           tgt_len: Optional[int] = None) -> Optional[Tensor]:
     if attention_mask is None:
         return None
-    # attention_mask 2D: [bsz, src_len] with 1 for keep, 0 for pad
     bsz, src_len = attention_mask.shape
     tgt_len = int(tgt_len or src_len)
-    keep = attention_mask[:, None, None, :].to(dtype=dtype)  # [bsz,1,1,src_len]
-    # 0.0 = allowed, -inf = masked out
-    bias = (1.0 - keep) * torch.finfo(dtype).min
+    keep = attention_mask[:, None, None, :].to(dtype=dtype)      # [B,1,1,S]
+    bias = (1.0 - keep) * torch.finfo(dtype).min                 # 0 allowed, -inf masked
     if bias.shape[2] != tgt_len:
         bias = bias.expand(bsz, 1, tgt_len, src_len)
     return bias
 
 class Gemma3EncoderForMaskedLM(Gemma3PreTrainedModel):
-    """
-    Encoder-only Gemma-3 with bidirectional self-attention (padding-only mask) and an MLM head.
-    """
     config_class = Gemma3TextConfig
     base_model_prefix = "encoder_model"
     _tied_weights_keys = ["lm_head.weight"]
@@ -40,7 +35,7 @@ class Gemma3EncoderForMaskedLM(Gemma3PreTrainedModel):
         self.encoder = Gemma3TextModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.post_init()  # enable tying etc.
+        self.post_init()
 
     def get_input_embeddings(self):
         return self.encoder.embed_tokens
@@ -53,18 +48,15 @@ class Gemma3EncoderForMaskedLM(Gemma3PreTrainedModel):
             self._tie_or_clone_weights(self.lm_head, self.get_input_embeddings())
 
     @staticmethod
-    def _infer_dtype(encoder: Gemma3TextModel,
-                     input_ids: Optional[Tensor],
-                     inputs_embeds: Optional[Tensor]) -> torch.dtype:
+    def _infer_dtype(encoder, input_ids, inputs_embeds):
         if inputs_embeds is not None:
             return inputs_embeds.dtype
-        # fall back to embedding weight dtype (reliable for bf16/fp16/fp32 choice)
         return encoder.embed_tokens.weight.dtype
 
     def forward(
         self,
         input_ids: Optional[Tensor] = None,
-        attention_mask: Optional[Tensor] = None,   # 2D pad mask from dataset
+        attention_mask: Optional[Tensor] = None,   # 2D: [B, S]
         position_ids: Optional[Tensor] = None,
         inputs_embeds: Optional[Tensor] = None,
         labels: Optional[Tensor] = None,
@@ -74,7 +66,7 @@ class Gemma3EncoderForMaskedLM(Gemma3PreTrainedModel):
         **kwargs,
     ) -> Union[MaskedLMOutput, Tuple[Tensor, ...]]:
 
-        # Determine target length and floating dtype
+        # lengths & dtype
         if input_ids is not None:
             tgt_len = input_ids.shape[1]
         elif inputs_embeds is not None:
@@ -83,10 +75,11 @@ class Gemma3EncoderForMaskedLM(Gemma3PreTrainedModel):
             tgt_len = None
         dtype = self._infer_dtype(self.encoder, input_ids, inputs_embeds)
 
-        # Build a fully bidirectional (padding-only) additive bias
-        bias4d = _padding_only_4d_mask(attention_mask, dtype=dtype, tgt_len=tgt_len)
+        # Which attention impl is active?
+        attn_impl = getattr(self.config, "_attn_implementation",
+                            getattr(self.config, "attn_implementation", "eager"))
+        use_fa2 = (attn_impl == "flash_attention_2")
 
-        # Figure out how to feed the 4D mask depending on the installed Transformers version
         enc_sig = inspect.signature(self.encoder.forward)
         params = set(enc_sig.parameters.keys())
         call_kwargs = dict(
@@ -97,14 +90,24 @@ class Gemma3EncoderForMaskedLM(Gemma3PreTrainedModel):
             output_hidden_states=output_hidden_states,
             use_cache=False,
         )
-        if "attention_bias" in params:
-            # Pass both: normal 2D attention_mask (pads) + 4D additive bias (non-causal)
+
+        # Ensure non-causal when FA2 (2D mask only)
+        # Add flags that some versions expose
+        for k in ("is_causal", "causal", "use_causal_mask"):
+            if k in params:
+                call_kwargs[k] = False
+
+        if use_fa2:
+            # FA2 varlen path expects 2D mask (no 4D bias)
             call_kwargs["attention_mask"] = attention_mask
-            call_kwargs["attention_bias"]  = bias4d
         else:
-            # Fallback: supply 4D bias via attention_mask directly
-            # (omit 2D attention_mask to avoid shape confusion)
-            call_kwargs["attention_mask"] = bias4d if bias4d is not None else attention_mask
+            # Non-FA2 path: feed additive 4D bias (fully bidirectional)
+            bias4d = _padding_only_4d_mask(attention_mask, dtype=dtype, tgt_len=tgt_len)
+            if "attention_bias" in params:
+                call_kwargs["attention_mask"] = attention_mask   # keep 2D for padding info
+                call_kwargs["attention_bias"]  = bias4d
+            else:
+                call_kwargs["attention_mask"] = bias4d if bias4d is not None else attention_mask
 
         outputs = self.encoder(**call_kwargs)
         hidden_states = outputs.last_hidden_state
