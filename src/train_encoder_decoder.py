@@ -32,6 +32,40 @@ from transformers import (
 from gemma3_biencoder import Gemma3EncoderForMaskedLM
 
 
+# ----------------- Custom Trainer for MLM Accuracy Logging -----------------
+
+class MLMAccuracyTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        Subclass to compute and log MLM accuracy on training batches.
+        """
+        # The `compute_loss` from `Trainer` will return the loss and model outputs
+        # if `return_outputs=True`. The outputs contain the logits.
+        loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
+
+        # Log MLM accuracy on the main process
+        if self.state.is_local_process_zero and "labels" in inputs:
+            logits = outputs.get("logits")
+            labels = inputs.get("labels")
+            if logits is not None and labels is not None:
+                predictions = torch.argmax(logits, dim=-1)
+                
+                # Mask for only the tokens that were actually masked for MLM
+                masked_tokens_mask = labels != -100
+                
+                # If there are any masked tokens in the batch...
+                if torch.any(masked_tokens_mask):
+                    # Calculate accuracy only on the masked tokens
+                    correct_predictions = (predictions[masked_tokens_mask] == labels[masked_tokens_mask]).sum()
+                    total_masked = masked_tokens_mask.sum()
+                    mlm_accuracy = correct_predictions / total_masked
+                    
+                    # Log the metric
+                    self.log({"mlm_accuracy": mlm_accuracy.item()})
+
+        return (loss, outputs) if return_outputs else loss
+
+
 # ------------------------- Packing utilities -------------------------
 
 def iter_trimmed_tokens(ds, eos_id: int) -> Iterator[int]:
@@ -254,7 +288,7 @@ def main():
         length_column_name="length",
     )
 
-    trainer = Trainer(
+    trainer = MLMAccuracyTrainer(
         model=model,
         args=targs,
         train_dataset=packed,
